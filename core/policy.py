@@ -62,6 +62,9 @@ def classify_basic(stress_score):
     """
     Classify system stress level based on computed stress score.
     
+    When PSI is integrated into the stress score, this classification
+    becomes more sensitive to actual kernel contention, not just utilization.
+    
     Args:
         stress_score (float): Normalized stress score in [0, 1]
     

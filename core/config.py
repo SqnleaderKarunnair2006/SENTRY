@@ -49,6 +49,10 @@ DEFAULT_CONFIG = {
         "cpu_weight": 0.5,
         "memory_weight": 0.3,
         "io_weight": 0.2,
+        "psi_weight": 0.0,
+        "psi_cpu_weight": 0.3,
+        "psi_memory_weight": 0.4,
+        "psi_io_weight": 0.3,
     },
     "cgroup": {
         "path": "/sys/fs/cgroup/sentry_bg",

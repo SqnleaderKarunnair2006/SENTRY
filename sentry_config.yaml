@@ -50,11 +50,17 @@ escalation:
 
 # Metric weights for stress score calculation
 # Adjust to prioritize different resources
-# Must sum to 1.0 for normalized scoring
+# All weights must sum to 1.0 for normalized scoring
+# PSI weight is opt-in and defaults to 0.0 for backward compatibility
 metrics:
   cpu_weight: 0.5          # CPU is most critical (50%)
   memory_weight: 0.3       # Memory is secondary (30%)
   io_weight: 0.2           # I/O is tertiary (20%)
+  psi_weight: 0.0          # PSI stall signals (opt-in, 0% by default)
+  # PSI sub-weights: how to distribute PSI contribution across resources
+  psi_cpu_weight: 0.3      # CPU PSI some_avg10 weight (30% of PSI)
+  psi_memory_weight: 0.4   # Memory PSI some_avg10 weight (40% of PSI)
+  psi_io_weight: 0.3       # I/O PSI some_avg10 weight (30% of PSI)
 
 # cgroup v2 configuration (Linux only)
 cgroup:
