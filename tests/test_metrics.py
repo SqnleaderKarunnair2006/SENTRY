@@ -4,7 +4,12 @@ import unittest
 from pathlib import Path
 
 from core.classifier import classify_stress, decision_hint, trend_label, trend_rising
-from core.metrics import SystemMetricsSampler, compute_stress
+from core.metrics import (
+    SystemMetricsSampler,
+    compute_stress,
+    compute_psi_score,
+    normalize_psi_avg10,
+)
 from core.process import ProcessSampler
 from core.procfs import (
     cpu_usage_percent,
@@ -52,6 +57,115 @@ class ProcfsParsingTests(unittest.TestCase):
         self.assertEqual(psi.full_avg10, 4.56)
 
 
+class PsiNormalizationTests(unittest.TestCase):
+    def test_normalize_psi_avg10_within_range(self):
+        # Normal PSI reading: 25% -> 0.25
+        self.assertEqual(normalize_psi_avg10(25.0), 0.25)
+    
+    def test_normalize_psi_avg10_zero(self):
+        # No stalls
+        self.assertEqual(normalize_psi_avg10(0.0), 0.0)
+    
+    def test_normalize_psi_avg10_at_100(self):
+        # Maximum normal: 100% -> 1.0
+        self.assertEqual(normalize_psi_avg10(100.0), 1.0)
+    
+    def test_normalize_psi_avg10_exceeds_100(self):
+        # Extreme contention: 150% -> clamped to 1.0
+        self.assertEqual(normalize_psi_avg10(150.0), 1.0)
+    
+    def test_normalize_psi_avg10_negative(self):
+        # Invalid negative: clamped to 0.0
+        self.assertEqual(normalize_psi_avg10(-10.0), 0.0)
+
+
+class PsiScoringTests(unittest.TestCase):
+    def test_compute_psi_score_all_none(self):
+        # No PSI data available
+        score = compute_psi_score(None, None, None)
+        self.assertIsNone(score)
+    
+    def test_compute_psi_score_balanced(self):
+        # Equal stress across resources
+        weights = {
+            "psi_cpu_weight": 1/3,
+            "psi_memory_weight": 1/3,
+            "psi_io_weight": 1/3,
+        }
+        score = compute_psi_score(30.0, 30.0, 30.0, weights)
+        # (0.3 * 1/3 + 0.3 * 1/3 + 0.3 * 1/3) = 0.3
+        self.assertAlmostEqual(score, 0.3, places=2)
+    
+    def test_compute_psi_score_memory_heavy(self):
+        # Memory dominates
+        weights = {
+            "psi_cpu_weight": 0.2,
+            "psi_memory_weight": 0.6,
+            "psi_io_weight": 0.2,
+        }
+        score = compute_psi_score(10.0, 50.0, 10.0, weights)
+        # (0.1 * 0.2 + 0.5 * 0.6 + 0.1 * 0.2) = 0.32
+        expected = 0.1 * 0.2 + 0.5 * 0.6 + 0.1 * 0.2
+        self.assertAlmostEqual(score, expected, places=2)
+    
+    def test_compute_psi_score_partial_none(self):
+        # Some PSI readings missing
+        score = compute_psi_score(50.0, None, 20.0)
+        self.assertIsNotNone(score)
+        self.assertGreater(score, 0.0)
+    
+    def test_compute_psi_score_extreme_clamped(self):
+        # Extreme values clamped to [0, 1]
+        score = compute_psi_score(200.0, 200.0, 200.0)
+        self.assertEqual(score, 1.0)
+
+
+class StressComputationTests(unittest.TestCase):
+    def test_compute_stress_utilization_only(self):
+        # No PSI: utilization-based stress
+        stress = compute_stress(cpu=50.0, memory=30.0, io=20.0)
+        expected = (0.5 * 50 + 0.3 * 30 + 0.2 * 20) / 100
+        self.assertAlmostEqual(stress, expected, places=2)
+    
+    def test_compute_stress_with_psi_disabled(self):
+        # PSI present but weight=0: ignored
+        weights = {
+            "cpu_weight": 0.5,
+            "memory_weight": 0.3,
+            "io_weight": 0.2,
+            "psi_weight": 0.0,
+        }
+        stress = compute_stress(cpu=50.0, memory=30.0, io=20.0, psi=0.8, weights=weights)
+        expected = (0.5 * 50 + 0.3 * 30 + 0.2 * 20) / 100
+        self.assertAlmostEqual(stress, expected, places=2)
+    
+    def test_compute_stress_with_psi_enabled(self):
+        # PSI enabled with weight
+        weights = {
+            "cpu_weight": 0.4,
+            "memory_weight": 0.2,
+            "io_weight": 0.1,
+            "psi_weight": 0.3,
+        }
+        util_stress = (0.4 * 50 + 0.2 * 30 + 0.1 * 20) / 100  # 0.26
+        psi_stress = 0.8
+        expected = 0.7 * util_stress + 0.3 * psi_stress
+        stress = compute_stress(cpu=50.0, memory=30.0, io=20.0, psi=psi_stress, weights=weights)
+        self.assertAlmostEqual(stress, expected, places=2)
+    
+    def test_compute_stress_psi_dominant(self):
+        # PSI heavily weighted
+        weights = {
+            "cpu_weight": 0.05,
+            "memory_weight": 0.05,
+            "io_weight": 0.05,
+            "psi_weight": 0.85,
+        }
+        stress = compute_stress(cpu=5.0, memory=5.0, io=5.0, psi=0.9, weights=weights)
+        expected = 0.15 * (0.05 * 5 + 0.05 * 5 + 0.05 * 5) / 100 + 0.85 * 0.9
+        self.assertAlmostEqual(stress, expected, places=2)
+
+
 class MetricsSamplerTests(unittest.TestCase):
     def test_sampler_uses_stateful_delta(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -79,8 +193,30 @@ class MetricsSamplerTests(unittest.TestCase):
             self.assertGreater(second.io_wait_percent, 0.0)
             self.assertEqual(
                 second.stress_score,
-                compute_stress(second.cpu_percent, second.memory_percent, second.io_wait_percent),
+                compute_stress(second.cpu_percent, second.memory_percent, second.io_wait_percent, second.psi_score),
             )
+    
+    def test_sampler_includes_psi_fields(self):
+        """PSI fields are always captured in SystemMetrics."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proc_root = Path(temp_dir)
+            (proc_root / "meminfo").write_text(
+                "MemTotal:       8000000 kB\nMemAvailable:   3000000 kB\n",
+                encoding="utf-8",
+            )
+            (proc_root / "stat").write_text(
+                "cpu  1000 0 500 5000 100 0 0 0 0 0\n",
+                encoding="utf-8",
+            )
+            # PSI not present, should be None
+            
+            sampler = SystemMetricsSampler(proc_root=str(proc_root), interval=0)
+            metrics = sampler.sample()
+            
+            self.assertIsNone(metrics.psi_cpu_some_avg10)
+            self.assertIsNone(metrics.psi_memory_some_avg10)
+            self.assertIsNone(metrics.psi_io_some_avg10)
+            self.assertIsNone(metrics.psi_score)
 
 
 class ProcessSamplerTests(unittest.TestCase):
