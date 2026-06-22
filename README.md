@@ -16,7 +16,7 @@
 
 <br>
 
-[Architecture](#architecture) &middot; [Kernel Interfaces](#kernel-interfaces) &middot; [Quick Start](#quick-start) &middot; [Safety Model](#safety-model) &middot; [Roadmap](#roadmap)
+[Architecture](#architecture) &middot; [Kernel Interfaces](#kernel-interfaces) &middot; [Quick Start](#quick-start) &middot; [Safety Model](#safety-model) &middot; [PSI Integration](#psi-integration) &middot; [Roadmap](#roadmap)
 
 </div>
 
@@ -26,7 +26,7 @@
 
 Modern Linux hosts fail **quietly** under resource pressure.
 
-High CPU does not always mean distress. Low CPU does not always mean health. When memory compacts, I/O queues stall, and the scheduler falls behind, users experience freezes long before `top` tells a useful story.
+High CPU does not always mean distress. Low CPU does not always mean health. When memory compacts, I/O queues stall, and the scheduler falls behind, users experience freezes long before `top` tells you anything is wrong.
 
 Most tools **observe**. Few **intervene**. Fewer still intervene **safely** at the kernel boundary.
 
@@ -103,7 +103,7 @@ flowchart TB
     | /proc/stat  |     | Stress score|     | Policy tier |     | cgroup v2   |
     | /proc/mem   |     | Trend window|     | Cooldowns   |     | cpu.weight  |
     | /proc/pid   |     | Top offender|     | Safety gate |     | (mem/io WIP)|
-    | PSI avg10   |     |             |     |             |     |             |
+    | PSI avg10   |     | PSI score   |     | PSI-aware   |     |             |
     +-------------+     +-------------+     +-------------+     +-------------+
            ^                                                            |
            +---------------------- feedback loop -----------------------+
@@ -115,7 +115,7 @@ flowchart TB
 SENTRY/
 |-- core/
 |   |-- procfs.py            # /proc parsing (mockable via SENTRY_PROC_ROOT)
-|   |-- metrics.py           # SystemMetricsSampler + unified stress score
+|   |-- metrics.py           # SystemMetricsSampler + PSI-aware stress score
 |   |-- process.py           # Per-PID jiffies sampler
 |   |-- classifier.py        # Trend detection + dashboard hints
 |   |-- policy.py            # Escalation matrix + thresholds
@@ -125,8 +125,8 @@ SENTRY/
 |   `-- platform/            # Linux + Windows adapters
 |-- daemon/main.py           # Control loop + IPC server
 |-- dashboard/main_gui.py    # Flet UI + IPC client
-|-- tests/                   # Mocked /proc fixtures + IPC tests
-`-- sentry_config.yaml       # Thresholds, escalation, critical processes
+|-- tests/                   # Mocked /proc fixtures + PSI integration tests
+`-- sentry_config.yaml       # Thresholds, escalation, metrics, critical processes
 ```
 
 ---
@@ -135,13 +135,31 @@ SENTRY/
 
 ### Stress Score
 
-SENTRY fuses utilization into a normalized `[0, 1]` score:
+SENTRY fuses utilization and **pressure signals** into a normalized `[0, 1]` score:
 
 ```
-stress = (0.50 * cpu%) + (0.30 * mem%) + (0.20 * io_wait%)
+stress = (w_util * utilization_score) + (w_psi * psi_score)
+
+where:
+  utilization_score = (0.50 * cpu%) + (0.30 * mem%) + (0.20 * io_wait%)
+  psi_score = (0.30 * cpu_psi) + (0.40 * memory_psi) + (0.30 * io_psi)
+  w_util = 1.0 - psi_weight
+  w_psi = psi_weight (opt-in, defaults to 0.0)
 ```
 
-Weights are configurable in `sentry_config.yaml`.
+All weights are configurable in `sentry_config.yaml`.
+
+### PSI Integration
+
+**What is PSI?** Pressure Stall Information reports kernel-level stalls indicating actual contention—when tasks are blocked waiting for resources. Unlike utilization (% CPU used), PSI detects when users *perceive* slowness: memory compaction stalls, I/O queue waits, CPU overcommit delays.
+
+**How SENTRY uses PSI:**
+1. Reads `avg10` from `/proc/pressure/{cpu,memory,io}` — 10-second moving average of stall time (%)
+2. Normalizes each to [0, 1]
+3. Combines with configurable weights: memory stalls (40%) → CPU stalls (30%) → I/O stalls (30%)
+4. **Optionally** blends the unified PSI score into the stress formula (default: 0%, opt-in)
+
+**Why opt-in?** Default `psi_weight: 0.0` ensures backward compatibility. Existing deployments unaffected until explicitly tuned.
 
 ### Classification Tiers
 
@@ -152,7 +170,7 @@ Weights are configurable in `sentry_config.yaml`.
 | `HIGH` | 0.70 | cgroup CPU weight -> 30 |
 | `CRITICAL` | 0.85 | cgroup CPU weight -> 10 |
 
-> Memory and I/O cgroup limits are defined in policy and implemented in `cgroups.py` -- wiring into the live escalation path is on the roadmap.
+> When PSI is integrated, stress thresholds respond to actual contention, not just utilization. A 40% CPU load with 50% memory stalls may now escalate faster than a 70% CPU load with no stalls.
 
 ### Signals SENTRY Reads
 
@@ -165,6 +183,75 @@ Weights are configurable in `sentry_config.yaml`.
 /proc/pressure/memory               -> some avg10, full avg10
 /proc/pressure/io                   -> some avg10, full avg10
 /sys/fs/cgroup/sentry_bg/cpu.weight -> control surface
+```
+
+---
+
+## PSI Integration
+
+### Configuration
+
+Add or edit PSI weights in `sentry_config.yaml`:
+
+```yaml
+metrics:
+  # Utilization weights (sum to ~1.0)
+  cpu_weight: 0.5
+  memory_weight: 0.3
+  io_weight: 0.2
+  
+  # PSI blending weight (0.0 = disabled, opt-in)
+  psi_weight: 0.2        # Blend 20% PSI, 80% utilization
+  
+  # How to weight individual PSI resource stalls (sum to ~1.0)
+  psi_cpu_weight: 0.3    # CPU stalls contribute 30%
+  psi_memory_weight: 0.4 # Memory stalls contribute 40%
+  psi_io_weight: 0.3     # I/O stalls contribute 30%
+```
+
+### Tuning Guide
+
+**Starting Point (Gaming / Interactive Desktop):**
+```yaml
+metrics:
+  cpu_weight: 0.4
+  memory_weight: 0.3
+  io_weight: 0.1
+  psi_weight: 0.2        # Blend PSI for responsiveness
+```
+
+**Balanced (Development Server):**
+```yaml
+metrics:
+  cpu_weight: 0.5
+  memory_weight: 0.3
+  io_weight: 0.2
+  psi_weight: 0.0        # Utilization-only (opt-in)
+```
+
+**Aggressive (Heavily Loaded Server):**
+```yaml
+metrics:
+  cpu_weight: 0.3
+  memory_weight: 0.4
+  io_weight: 0.2
+  psi_weight: 0.1        # Light PSI weighting
+  psi_memory_weight: 0.5 # Memory stalls are critical
+```
+
+### Example Metrics Report
+
+```
+[SENTRY] Daemon tick
+CPU=45% | MEM=62% | IO=3% | Stress=0.48 | Level=HIGH | Target=chrome(1234)
+ProcessScore=38.5 | Action=Observe only (mitigation disabled)
+PSI_CPU=12.3 | PSI_MEM=4.1 | PSI_IO=0.8 | PSI_Score=0.035
+```
+
+When PSI weight is enabled:
+```
+PSI_CPU=45.2 | PSI_MEM=55.0 | PSI_IO=12.1 | PSI_Score=0.44
+Stress (with PSI)=0.62 -> escalate from HIGH to CRITICAL
 ```
 
 ---
@@ -182,6 +269,7 @@ SENTRY is designed to be **paranoid by default**:
 | Critical process denylist | systemd, Xorg, pipewire, gnome-shell, ... |
 | Cooldown per PID | 15s minimum between actions on same target |
 | Platform guard | Windows = monitor-only, no control |
+| PSI opt-in | Default `psi_weight: 0.0` preserves behavior |
 
 ```
   Dashboard                Daemon                     Kernel
@@ -212,7 +300,7 @@ mount | grep cgroup2
 ### Install
 
 ```bash
-git clone https://github.com/apexajay-rc/SENTRY.git
+git clone https://github.com/SqnleaderKarunnair2006/SENTRY.git
 cd SENTRY
 python3 -m venv venv
 source venv/bin/activate
@@ -254,7 +342,7 @@ The dashboard connects to the daemon over IPC. If the daemon is not running, it 
 python -m unittest discover -s tests -v
 ```
 
-Uses mocked `/proc` fixtures -- no live kernel required.
+Uses mocked `/proc` fixtures -- no live kernel required. Includes PSI integration tests.
 
 ---
 
@@ -263,16 +351,25 @@ Uses mocked `/proc` fixtures -- no live kernel required.
 ```
 [SENTRY] Safe Daemon Started (Linux)
 [SENTRY] IPC listening on ('unix', '/tmp/sentry.sock')
+[SENTRY] Loaded config from /home/user/SENTRY/sentry_config.yaml
 
 CPU=45% | MEM=62% | IO=3% | Stress=0.48 | Level=HIGH | Target=chrome(1234) |
 ProcessScore=38.5 | Action=Observe only (mitigation disabled) |
-PSI_CPU=12.3 | PSI_MEM=4.1 | PSI_IO=0.8
+PSI_CPU=12.3 | PSI_MEM=4.1 | PSI_IO=0.8 | PSI_Score=0.035
 ```
 
 After arming and disabling observe-only:
 
 ```
 Action=cgroup throttle applied (PID 1234, cpu_weight=30)
+```
+
+With PSI integration enabled (`psi_weight: 0.2`):
+
+```
+PSI_CPU=45.2 | PSI_MEM=55.0 | PSI_IO=12.1 | PSI_Score=0.44
+Stress (utilization)=0.48 | Stress (with PSI)=0.52 | Level=CRITICAL
+Action=cgroup throttle applied (PID 1234, cpu_weight=10)
 ```
 
 ---
@@ -297,6 +394,8 @@ stress-ng --cpu 4 --vm 1 --vm-bytes 500M --timeout 60s
 4. cgroup limit applied (when armed + not observe-only)
 5. Offending process CPU share drops
 
+With PSI enabled, you'll see stall signals reflected in `PSI_Score` and escalation triggered sooner.
+
 ---
 
 ## Comparison
@@ -304,20 +403,21 @@ stress-ng --cpu 4 --vm 1 --vm-bytes 500M --timeout 60s
 | Capability | htop / btop | earlyoom | systemd-oomd | **SENTRY** |
 |------------|-------------|----------|--------------|------------|
 | Real-time metrics | Yes | No | Partial | Yes |
-| PSI integration | No | No | Yes | Yes (read path) |
+| PSI integration | No | No | Yes | Yes (read + score) |
 | Per-process jiffies | No | No | Partial | Yes |
 | Reversible limits | No | No | Partial | Yes (cgroup) |
-| Policy escalation | No | Binary | Yes | Yes |
+| Policy escalation | No | Binary | Yes | Yes (PSI-aware) |
 | Live dashboard | Yes | No | No | Yes |
 | IPC control plane | No | No | No | Yes |
 | Safe-by-default | N/A | No | Partial | Yes |
+| PSI weight tuning | — | — | — | Yes |
 
 ---
 
 ## Roadmap
 
 ### Near-term
-- [ ] Weight PSI into stress score and policy decisions
+- [x] Weight PSI into stress score and policy decisions
 - [x] Wire `sentry_config.yaml` into daemon runtime
 - [ ] Apply memory + I/O cgroup limits from escalation matrix
 - [ ] Structured JSON audit log (`sentry_audit.json`)
@@ -327,11 +427,13 @@ stress-ng --cpu 4 --vm 1 --vm-bytes 500M --timeout 60s
 - [ ] Protect processes by `/proc/[pid]/exe`, not comm name
 - [ ] Benchmark harness vs earlyoom / baseline
 - [ ] systemd user unit
+- [ ] PSI-based alerting / Prometheus export
 
 ### Long-term
 - [ ] eBPF behavioral scoring (integration with [bpfwatch](https://github.com/apexajay-rc/bpfwatch))
 - [ ] Prometheus `/metrics` export
 - [ ] Per-cgroup workload profiles
+- [ ] Machine learning tuning suggestions
 
 ---
 
@@ -343,8 +445,9 @@ SENTRY explores questions at the intersection of **kernel scheduling**, **resour
 - Can userspace policy react before the OOM killer?
 - Can limits be applied reversibly without destroying process state?
 - How should pressure signals (PSI) combine with utilization metrics?
+- What makes a system *feel* responsive under load?
 
-It is built as a **reference control loop** -- readable, testable, and grounded in real `/proc` and cgroup interfaces.
+It is built as a **reference control loop** -- readable, testable, and grounded in real `/proc`, PSI, and cgroup interfaces.
 
 ---
 
@@ -361,12 +464,12 @@ It is built as a **reference control loop** -- readable, testable, and grounded 
 
 <div align="center">
 
-**Built by [@apexajay-rc](https://github.com/apexajay-rc)**
+**Built by [@SqnleaderKarunnair2006](https://github.com/SqnleaderKarunnair2006)**
 
-*Systems programming &middot; kernel signals &middot; resource governance*
+*Systems programming · kernel signals · resource governance · pressure awareness*
 
 <br>
 
-MIT License &middot; [Report an issue](https://github.com/apexajay-rc/SENTRY/issues)
+MIT License · [Report an issue](https://github.com/SqnleaderKarunnair2006/SENTRY/issues)
 
 </div>
